@@ -4920,7 +4920,15 @@ SG) showgj="新加坡" ;;
 SK) showgj="斯洛伐克" ;;
 US) showgj="美国" ;;
 esac
-grep -q "country" /etc/s-box/sbwpph.log 2>/dev/null && s5ms="多地区Psiphon代理模式 (端口:$s5port  国家:$showgj)" || s5ms="本地Warp代理模式 (端口:$s5port)"
+# 检查是否为多国家模式
+if [[ -d /etc/s-box/multi-vpn ]] && [[ $(ls -A /etc/s-box/multi-vpn/*.pid 2>/dev/null | wc -l) -gt 0 ]]; then
+multi_count=$(ls /etc/s-box/multi-vpn/*.pid 2>/dev/null | wc -l)
+echo -e "WARP-plus-Socks5状态：$yellow已启动 多国家VPN模式 ($multi_count个国家，端口40001-40032)$plain"
+elif grep -q "country" /etc/s-box/sbwpph.log 2>/dev/null; then
+s5ms="多地区Psiphon代理模式 (端口:$s5port  国家:$showgj)"
+echo -e "WARP-plus-Socks5状态：$yellow已启动 $s5ms$plain"
+elif [[ -n $(ps -e | grep sbwpph) ]]; then
+s5ms="本地Warp代理模式 (端口:$s5port)"
 echo -e "WARP-plus-Socks5状态：$yellow已启动 $s5ms$plain"
 else
 echo -e "WARP-plus-Socks5状态：$yellow未启动$plain"
@@ -4987,10 +4995,23 @@ cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
 restartsb
 }
 unins(){
+# 停止单个sbwpph进程
 kill -15 $(cat /etc/s-box/sbwpphid.log 2>/dev/null) >/dev/null 2>&1
 rm -rf /etc/s-box/sbwpph.log /etc/s-box/sbwpphid.log
+
+# 停止多国家VPN进程
+if [[ -d /etc/s-box/multi-vpn ]]; then
+for pidfile in /etc/s-box/multi-vpn/*.pid; do
+if [[ -f "$pidfile" ]]; then
+kill -15 $(cat "$pidfile" 2>/dev/null) >/dev/null 2>&1
+fi
+done
+rm -rf /etc/s-box/multi-vpn
+fi
+
 crontab -l > /tmp/crontab.tmp
 sed -i '/sbwpphid.log/d' /tmp/crontab.tmp
+sed -i '/multi-vpn/d' /tmp/crontab.tmp
 crontab /tmp/crontab.tmp
 rm /tmp/crontab.tmp
 }
@@ -4998,8 +5019,9 @@ echo
 yellow "1：重置启用WARP-plus-Socks5本地Warp代理模式"
 yellow "2：重置启用WARP-plus-Socks5多地区Psiphon代理模式"
 yellow "3：停止WARP-plus-Socks5代理模式"
+yellow "4：同时启动所有32个国家VPN（端口40001-40032）"
 yellow "0：返回上层"
-readp "请选择【0-3】：" menu
+readp "请选择【0-4】：" menu
 if [ "$menu" = "1" ]; then
 ins
 nohup setsid /etc/s-box/sbwpph -b 127.0.0.1:$port --gool -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1 & echo "$!" > /etc/s-box/sbwpphid.log
@@ -5071,6 +5093,52 @@ green "WARP-plus-Socks5的IP获取成功，可进行Socks5代理分流"
 fi
 elif [ "$menu" = "3" ]; then
 unins && green "已停止WARP-plus-Socks5代理功能"
+elif [ "$menu" = "4" ]; then
+ins
+green "正在启动32个国家的VPN代理..."
+countries=("AT" "AU" "BE" "BG" "CA" "CH" "CZ" "DE" "DK" "EE" "ES" "FI" "FR" "GB" "HR" "HU" "IE" "IN" "IT" "JP" "LT" "LV" "NL" "NO" "PL" "PT" "RO" "RS" "SE" "SG" "SK" "US")
+port_base=40000
+mkdir -p /etc/s-box/multi-vpn
+rm -rf /etc/s-box/multi-vpn/*
+
+for i in "${!countries[@]}"; do
+country="${countries[$i]}"
+current_port=$((port_base + i + 1))
+echo "启动 $country (端口: $current_port)..."
+nohup setsid /etc/s-box/sbwpph -b 127.0.0.1:$current_port --cfon --country $country -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1 & 
+echo "$!" > /etc/s-box/multi-vpn/${country}_${current_port}.pid
+echo "/etc/s-box/sbwpph -b 127.0.0.1:$current_port --cfon --country $country -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1" > /etc/s-box/multi-vpn/${country}_${current_port}.cmd
+sleep 0.5
+done
+
+green "等待30秒，让所有VPN连接建立..."
+sleep 30
+
+# 验证连接
+green "验证VPN连接状态："
+success_count=0
+for i in "${!countries[@]}"; do
+country="${countries[$i]}"
+current_port=$((port_base + i + 1))
+resv=$(timeout 5 curl -s --socks5 127.0.0.1:$current_port icanhazip.com 2>/dev/null)
+if [[ -n $resv ]]; then
+echo "✓ $country (端口:$current_port) - IP: $resv"
+success_count=$((success_count + 1))
+else
+echo "✗ $country (端口:$current_port) - 连接失败"
+fi
+done
+
+green "成功启动 $success_count/32 个国家的VPN代理"
+
+# 设置自动重启
+crontab -l > /tmp/crontab.tmp 2>/dev/null || true
+sed -i '/multi-vpn/d' /tmp/crontab.tmp
+echo '@reboot sleep 15 && for cmd in /etc/s-box/multi-vpn/*.cmd; do [ -f "$cmd" ] && nohup setsid $(cat "$cmd") & pid=$! && echo $pid > "${cmd%.cmd}.pid"; done' >> /tmp/crontab.tmp
+crontab /tmp/crontab.tmp
+rm /tmp/crontab.tmp
+
+green "所有国家VPN已启动，端口范围：40001-40032"
 else
 sb
 fi
